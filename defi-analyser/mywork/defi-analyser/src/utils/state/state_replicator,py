@@ -1,0 +1,246 @@
+# src/utils/state/state_replicator.py
+
+import asyncio
+from typing import Dict, List, Optional, Set
+from dataclasses import dataclass
+from ..config import config
+from ..logger import logger
+from .state_manager import StateManager, ChainState, StateUpdate
+
+@dataclass
+class ReplicationConfig:
+    source_chain_id: int
+    target_chain_id: int
+    protocols: List[str]
+    sync_interval: int
+    priority: int
+    max_retries: int
+
+@dataclass
+class ReplicationStatus:
+    config: ReplicationConfig
+    last_sync: float
+    sync_count: int
+    failed_attempts: int
+    last_error: Optional[str]
+    state_diff: Dict
+
+class StateReplicator:
+    def __init__(self):
+        self.state_manager = StateManager()
+        self.active_replications: Dict[str, ReplicationConfig] = {}
+        self.replication_status: Dict[str, ReplicationStatus] = {}
+        self.sync_locks: Dict[str, asyncio.Lock] = {}
+        
+    async def start_replication(self, config: ReplicationConfig) -> bool:
+        """Start state replication between chains"""
+        try:
+            # Validate configuration
+            if not self._validate_replication_config(config):
+                raise ValueError("Invalid replication configuration")
+                
+            # Generate replication ID
+            replication_id = self._generate_replication_id(config)
+            
+            # Check if already active
+            if replication_id in self.active_replications:
+                logger.warning(f"Replication {replication_id} already active")
+                return False
+                
+            # Initialize replication
+            self.active_replications[replication_id] = config
+            self.sync_locks[replication_id] = asyncio.Lock()
+            
+            # Initialize status
+            self.replication_status[replication_id] = ReplicationStatus(
+                config=config,
+                last_sync=0,
+                sync_count=0,
+                failed_attempts=0,
+                last_error=None,
+                state_diff={}
+            )
+            
+            # Start replication task
+            asyncio.create_task(self._replication_loop(replication_id))
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error starting replication: {str(e)}")
+            return False
+
+    async def stop_replication(self, replication_id: str) -> bool:
+        """Stop state replication"""
+        try:
+            if replication_id not in self.active_replications:
+                return False
+                
+            # Remove configuration
+            del self.active_replications[replication_id]
+            
+            # Clean up status
+            if replication_id in self.replication_status:
+                del self.replication_status[replication_id]
+                
+            # Remove lock
+            if replication_id in self.sync_locks:
+                del self.sync_locks[replication_id]
+                
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error stopping replication: {str(e)}")
+            return False
+
+    async def get_replication_status(self, replication_id: str) -> Optional[ReplicationStatus]:
+        """Get current replication status"""
+        return self.replication_status.get(replication_id)
+
+    async def _replication_loop(self, replication_id: str):
+        """Main replication loop"""
+        while replication_id in self.active_replications:
+            try:
+                config = self.active_replications[replication_id]
+                status = self.replication_status[replication_id]
+                
+                async with self.sync_locks[replication_id]:
+                    # Perform state sync
+                    await self._sync_states(replication_id)
+                    
+                    # Update status
+                    status.sync_count += 1
+                    
+                # Wait for next sync
+                await asyncio.sleep(config.sync_interval)
+                
+            except Exception as e:
+                logger.error(f"Error in replication loop: {str(e)}")
+                status.failed_attempts += 1
+                status.last_error = str(e)
+                
+                if status.failed_attempts >= config.max_retries:
+                    await self.stop_replication(replication_id)
+                    break
+                    
+                await asyncio.sleep(5)  # Short delay before retry
+
+    async def _sync_states(self, replication_id: str):
+        """Synchronize states between chains"""
+        try:
+            config = self.active_replications[replication_id]
+            status = self.replication_status[replication_id]
+            
+            # Get source state
+            source_state = await self.state_manager.get_state(config.source_chain_id)
+            
+            # Get target state
+            target_state = await self.state_manager.get_state(config.target_chain_id)
+            
+            # Calculate state differences
+            state_diff = self._calculate_state_diff(
+                source_state,
+                target_state,
+                config.protocols
+            )
+            
+            # Update status
+            status.state_diff = state_diff
+            
+            if state_diff:
+                # Create state update
+                update = StateUpdate(
+                    chain_id=config.target_chain_id,
+                    updates=state_diff,
+                    block_number=source_state.block_number,
+                    timestamp=source_state.timestamp,
+                    source=f"replication_{replication_id}",
+                    priority=config.priority
+                )
+                
+                # Apply update
+                await self.state_manager.update_state(update)
+                
+            status.last_sync = asyncio.get_event_loop().time()
+            status.last_error = None
+            
+        except Exception as e:
+            logger.error(f"Error syncing states: {str(e)}")
+            status.last_error = str(e)
+            status.failed_attempts += 1
+            raise
+
+    def _calculate_state_diff(self,
+                            source_state: ChainState,
+                            target_state: ChainState,
+                            protocols: List[str]) -> Dict:
+        """Calculate state differences between chains"""
+        try:
+            diff = {}
+            
+            for protocol in protocols:
+                source_protocol_state = source_state.protocol_states.get(protocol, {})
+                target_protocol_state = target_state.protocol_states.get(protocol, {})
+                
+                # Calculate protocol state diff
+                protocol_diff = self._diff_protocol_states(
+                    source_protocol_state,
+                    target_protocol_state
+                )
+                
+                if protocol_diff:
+                    diff[protocol] = protocol_diff
+                    
+            return diff
+            
+        except Exception as e:
+            logger.error(f"Error calculating state diff: {str(e)}")
+            return {}
+
+    def _diff_protocol_states(self,
+                            source_state: Dict,
+                            target_state: Dict) -> Dict:
+        """Calculate difference between protocol states"""
+        try:
+            diff = {}
+            
+            # Compare all fields in source state
+            for key, value in source_state.items():
+                if key not in target_state or target_state[key] != value:
+                    diff[key] = value
+                    
+            return diff
+            
+        except Exception as e:
+            logger.error(f"Error diffing protocol states: {str(e)}")
+            return {}
+
+    def _validate_replication_config(self, config: ReplicationConfig) -> bool:
+        """Validate replication configuration"""
+        try:
+            # Check chain IDs
+            if not config.source_chain_id or not config.target_chain_id:
+                return False
+                
+            # Validate chains are supported
+            if not (config.source_chain_id in config.get_all_chain_ids() and
+                   config.target_chain_id in config.get_all_chain_ids()):
+                return False
+                
+            # Check protocols
+            if not config.protocols:
+                return False
+                
+            # Validate intervals and retries
+            if config.sync_interval < 1 or config.max_retries < 1:
+                return False
+                
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error validating config: {str(e)}")
+            return False
+
+    def _generate_replication_id(self, config: ReplicationConfig) -> str:
+        """Generate unique replication ID"""
+        return f"repl_{config.source_chain_id}_{config.target_chain_id}"
